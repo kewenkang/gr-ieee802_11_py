@@ -29,8 +29,9 @@ class frame_equalizer(gr.sync_block):
     def __init__(self, algo, freq, bw, verbose):
         gr.sync_block.__init__(self,
             name="frame_equalizer",
-            in_sig=[numpy.float],
-            out_sig=[numpy.float])
+            in_sig=[(numpy.complex64, 64)],
+            out_sig=[48])
+        
 
 
     def work(self, input_items, output_items):

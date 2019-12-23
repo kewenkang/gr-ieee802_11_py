@@ -22,6 +22,7 @@
 import numpy
 from enum import Enum
 from gnuradio import gr
+import pmt
 import utils
 
 class State(Enum):
@@ -52,6 +53,7 @@ class sync_long(gr.basic_block):
     """
     docstring for block sync_long
     """
+
     def __init__(self, sync_length, verbose):
         gr.basic_block.__init__(self,
             name="sync_long",
@@ -63,21 +65,114 @@ class sync_long(gr.basic_block):
         self.d_sync_length = sync_length
         self.d_fir = gr.filter.kernel.fir_filter_ccc(1, LONG)
 
+        self.d_cor = []
+        self.d_freq_offset_short = 0
+        self.d_frame_start = 0
+        self.d_freq_offset = 0
+        self.d_count = 0
+
         set_tag_propagation_policy(gr.block.TPP_DONT)
+
+    def forecast(self, noutput_items, ninput_items_required):
+        if self.d_state == State.SYNC:
+            ninput_items_required[0] = 64
+            ninput_items_required[1] = 64
+        else:
+            ninput_items_required[0] = noutput_items
+            ninput_items_required[1] = noutput_items
+
+    def search_frame_start(self):
+        assert len(self.d_cor) == self.d_sync_length
+        cor = numpy.abs(self.d_cor)
+        indices = numpy.argsort(cor)[::-1]
+
+        for i in range(3):
+            for k in range(i+1, 4):
+                if indices[i] >= indices[k]:
+                    first = cor[indices[i]]
+                    second = cor[indices[k]]
+                else:
+                    first = cor[indices[k]]
+                    second = cor[indices[i]]
+                diff = abs(indices[i] - indices[k])
+                if diff == 64:
+                    # best match
+                    self.d_frame_start = min(indices[i], indices[k])
+                    self.d_freq_offset = numpy.angle(first * numpy.conj(second)) / 64
+                    return
+                elif diff == 63 or diff == 65:
+                    self.d_frame_start = min(indices[i], indices[k])
+                    self.d_freq_offset = numpy.angle(first * numpy.conj(second)) / diff
 
     def general_work(self, input_items, output_items):
         in0 = input_items[0]
         in_delayed = input_items[1]
         out = output_items[0]
+        noutput = len(output_items[0])
         # <+signal processing here+>
         self.d_logger.debug('LONG ninput[0]: {}, ninput[1]: {}, noutput: {}, state: {}'.format(
             len(input_items[0]), len(input_items[1]), len(output_items[0]), self.d_state))
 
         ninput = min(min(len(input_items[0]), len(input_items[1])), 8192)
-        nread = nitems_read(0)
-        tags = get_tags_in_range(0, nread, nread + ninput)
-        if len(tags) > 0:
-            sorted()
-        out[:] = in0
-        return len(output_items[0])
+        nread = nitems_read(0)  # get absolute index
+        tags = get_tags_in_range(0, nread, nread + ninput)  # get tages of this samples
+        if len(tags):
+            tags = sorted(tags, key=lambda tag: tag.offset)
+            offset = tags[0].offset
+
+            if offset > nread:
+                ninput = offset - nread
+            else:
+                if self.d_offset and self.d_state == State.SYNC:
+                    raise Exception("wtf")
+                if self.d_state == State.COPY:
+                    self.d_state = State.RESET
+                self.d_freq_offset_short = pmt.to_double(tags[0].value)
+
+        #
+        i = 0
+        o = 0
+        if self.d_state == State.SYNC:
+            cor = self.d_fir.filterN(in0, min(self.d_sync_length, max(ninput - 63, 0)))
+            while i + 63 < ninput:
+                self.d_cor.append(cor[i])
+                i += 1
+                self.d_offset += 1
+
+                if self.d_offset == self.d_sync_length:
+                    self.search_frame_start()
+                    self.d_logger.debug('LONG: frame start at {}'.format(self.d_frame_start))
+                    self.d_offset = 0
+                    self.d_count = 0
+                    self.d_state = State.COPY
+                    break
+
+        elif self.d_state == State.COPY:
+            while i < ninput and o < noutput:
+                rel = self.d_offset - self.d_frame_start
+                if not rel:
+                    add_item_tag(0, nitems_written(0),
+                                 pmt.intern('wifi_start'),
+                                 pmt.from_double(self.d_freq_offset_short - self.d_freq_offset),
+                                 pmt.intern(name()))
+                if rel >= 0 and (rel < 128 or ((rel - 128) % 80) > 15):
+                    out[o] = in_delayed[i] * numpy.exp(complex(0, self.d_offset * self.d_freq_offset))
+                    o += 1
+                i += 1
+                self.d_offset += 1
+
+        elif self.d_state == State.RESET:
+            while o < noutput:
+                if (self.d_count + o) % 64 == 0:
+                    self.d_offset = 0
+                    self.d_state = State.SYNC
+                    break
+                else:
+                    out[o] = 0
+                    o += 1
+        self.d_logger.debug('produced: {}, consumed: {}'.format(o, i))
+        self.d_count += o
+        comsume_each(i)
+        # out[:] = in0
+        return o
 
